@@ -17,10 +17,124 @@ _ROCM_FLASH_ATTN_AVAILABLE = False
 
 if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
-    from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
-        flash_attn_varlen_func,
-        get_scheduler_metadata,
-    )
+
+    # Try sgl_kernel FA3 first (faster kernel implementation)
+    _USE_SGL_KERNEL_FA = False
+    try:
+        from sgl_kernel.flash_attn import (
+            flash_attn_varlen_func as _sgl_flash_attn_varlen_func,
+        )
+        _USE_SGL_KERNEL_FA = True
+        logger.info("Using sgl_kernel FlashAttention (faster FA3)")
+    except ImportError:
+        pass
+
+    if _USE_SGL_KERNEL_FA:
+        def flash_attn_varlen_func(  # type: ignore[misc]
+            q, k, v,
+            max_seqlen_q=None, cu_seqlens_q=None,
+            max_seqlen_k=None, cu_seqlens_k=None,
+            seqused_k=None, q_v=None,
+            dropout_p=0.0, softmax_scale=None, causal=False,
+            window_size=None, softcap=0.0, alibi_slopes=None,
+            deterministic=False, return_attn_probs=False,
+            block_table=None, return_softmax_lse=False, out=None,
+            scheduler_metadata=None,
+            q_descale=None, k_descale=None, v_descale=None,
+            num_splits=0, fa_version=3, s_aux=None,
+            cp_world_size=1, cp_rank=0, cp_tot_seqused_k=None,
+        ):
+            # Map vLLM call signature to sgl_kernel C++ op directly
+            import torch as _torch
+            sgl_window = tuple(window_size) if window_size is not None else (-1, -1)
+            if softmax_scale is None:
+                softmax_scale = q.shape[-1] ** (-0.5)
+            _num_splits = num_splits if num_splits > 0 else 1
+
+            # Two modes: paged (block_table != None) vs varlen (contiguous K/V)
+            if block_table is not None:
+                # Paged KV cache mode — mirrors flash_attn_with_kvcache
+                # cu_seqlens_k=None, max_seqlen_k=None, seqused_k=cache_seqlens
+                result_out, result_lse, *rest = _torch.ops.sgl_kernel.fwd.default(
+                    q,                      # q
+                    k,                      # k_cache
+                    v,                      # v_cache
+                    None,                   # k_new
+                    None,                   # v_new
+                    q_v,                    # qv
+                    None,                   # out
+                    cu_seqlens_q,           # cu_seqlens_q
+                    None,                   # cu_seqlens_k (None for paged)
+                    None,                   # cu_seqlens_k_new
+                    None,                   # seqused_q
+                    seqused_k,              # cache_seqlens
+                    max_seqlen_q,           # max_seqlen_q
+                    None,                   # max_seqlen_k (None for paged)
+                    block_table,            # page_table
+                    None,                   # kv_batch_idx
+                    None,                   # leftpad_k
+                    None,                   # rotary cos
+                    None,                   # rotary sin
+                    None,                   # seqlens_rotary
+                    q_descale,
+                    k_descale,
+                    v_descale,
+                    softmax_scale,
+                    causal,
+                    sgl_window[0],
+                    sgl_window[1],
+                    0,                      # attention_chunk
+                    softcap,
+                    is_rotary_interleaved=False,
+                    scheduler_metadata=None,
+                    num_splits=_num_splits,
+                    pack_gqa=None,
+                    sm_margin=0,
+                    sinks=s_aux,
+                )
+            else:
+                # Varlen mode — contiguous K/V (prefill without paged cache)
+                result_out, result_lse, *rest = _torch.ops.sgl_kernel.fwd.default(
+                    q, k, v,
+                    None, None, q_v, None,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    None, None,
+                    seqused_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    None,                   # no page_table
+                    None, None, None, None, None,
+                    q_descale, k_descale, v_descale,
+                    softmax_scale, causal,
+                    sgl_window[0], sgl_window[1],
+                    0, softcap,
+                    is_rotary_interleaved=False,
+                    scheduler_metadata=None,
+                    num_splits=_num_splits,
+                    pack_gqa=None, sm_margin=0, sinks=s_aux,
+                )
+            result = (result_out, result_lse)
+            if out is not None:
+                # sgl_kernel allocates output internally; copy to vLLM's buffer
+                if isinstance(result, tuple):
+                    out.copy_(result[0])
+                else:
+                    out.copy_(result)
+            if return_softmax_lse and isinstance(result, tuple):
+                return result  # (out, lse)
+            if isinstance(result, tuple):
+                return result[0]
+            return result
+
+        def get_scheduler_metadata(*args, **kwargs):  # type: ignore[misc]
+            # sgl_kernel FA3 doesn't use scheduler_metadata
+            return None
+    else:
+        from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
+            flash_attn_varlen_func,
+            get_scheduler_metadata,
+        )
 
 elif current_platform.is_xpu():
     from vllm import _custom_ops as ops
