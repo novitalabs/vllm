@@ -66,6 +66,65 @@ _NOVITA_ONE_SHOT_MAX_SIZES_MB: dict[int, dict[int, float]] = {
 
 MiB = 1024 * 1024
 
+# Token-count range where novita kernel is slower than flashinfer.
+# Benchmarked on H200 / tp=8 / hidden=7168:
+#   tokens ≤ 128  → novita wins  (up to 2.9×)
+#   tokens 160-768 → flashinfer wins
+#   tokens ≥ 896  → novita wins again
+NOVITA_AR_FALLBACK_MIN_TOKENS = 160
+NOVITA_AR_FALLBACK_MAX_TOKENS = 768
+
+_logged_fallback = False
+
+
+def _flashinfer_allreduce_fallback(
+    allreduce_in: torch.Tensor,
+    residual: torch.Tensor,
+    rms_gamma: torch.Tensor,
+    rms_eps: float,
+    workspace: object,
+    pattern_code: int,
+    launch_with_pdl: bool,
+    fp32_acc: bool,
+    use_oneshot: bool,
+    norm_out: torch.Tensor | None,
+    quant_out: torch.Tensor | None,
+    scale_out: torch.Tensor | None,
+    scale_factor: torch.Tensor | None,
+) -> None:
+    """Call the native flashinfer allreduce_fusion kernel directly."""
+    import flashinfer.comm as fi_comm
+
+    if norm_out is None:
+        actual_norm_out = allreduce_in
+        residual_out = residual
+    else:
+        actual_norm_out = norm_out
+        residual_out = allreduce_in
+
+    layout_code = None
+    if workspace.backend == "trtllm":  # type: ignore[union-attr]
+        layout_code = fi_comm.QuantizationSFLayout.SWIZZLED_128x4
+
+    fi_comm.allreduce_fusion(
+        input=allreduce_in,
+        workspace=workspace,
+        pattern=pattern_code,
+        launch_with_pdl=launch_with_pdl,
+        output=None,
+        residual_out=residual_out,
+        norm_out=actual_norm_out,
+        quant_out=quant_out,
+        scale_out=scale_out,
+        residual_in=residual,
+        rms_gamma=rms_gamma,
+        rms_eps=rms_eps,
+        scale_factor=scale_factor,
+        layout_code=layout_code,
+        use_oneshot=use_oneshot,
+        fp32_acc=fp32_acc,
+    )
+
 
 def call_novita_fused_allreduce_norm(
     allreduce_in: torch.Tensor,
@@ -86,6 +145,10 @@ def call_novita_fused_allreduce_norm(
 
     Mirrors the flashinfer_trtllm_fused_allreduce_norm signature exactly.
     Uses flashinfer workspace for IPC shared memory management.
+
+    When token count falls in the novita-kernel disadvantage zone
+    (NOVITA_AR_FALLBACK_MIN_TOKENS .. NOVITA_AR_FALLBACK_MAX_TOKENS),
+    falls back to the native flashinfer kernel automatically.
     """
     from vllm.distributed import get_tp_group
     from vllm.distributed.device_communicators.flashinfer_all_reduce import (
@@ -127,20 +190,52 @@ def call_novita_fused_allreduce_norm(
         import flashinfer.comm as _fi_comm
 
         ar_patterns = _fi_comm.AllReduceFusionPattern
-        if pattern_code in (
+        is_quant = pattern_code in (
             ar_patterns.kARResidualRMSNormFP8Quant,
             ar_patterns.kARResidualRMSNormFP4Quant,
-        ):
-            workspace = get_fi_ar_quant_workspace(**workspace_kwargs)
-        else:
-            workspace = get_fi_ar_workspace(**workspace_kwargs)
+        )
     except ImportError:
-        workspace = get_fi_ar_workspace(**workspace_kwargs)
+        is_quant = False
 
+    workspace = (
+        get_fi_ar_quant_workspace(**workspace_kwargs)
+        if is_quant
+        else get_fi_ar_workspace(**workspace_kwargs)
+    )
     assert workspace is not None, (
         "Flashinfer workspace must be initialized for novita allreduce fusion"
     )
 
+    # --- token-count based dispatch ---
+    if NOVITA_AR_FALLBACK_MIN_TOKENS <= num_tokens <= NOVITA_AR_FALLBACK_MAX_TOKENS:
+        global _logged_fallback
+        if not _logged_fallback:
+            logger.info(
+                "novita AR fallback to flashinfer for %d tokens "
+                "(disadvantage zone %d-%d)",
+                num_tokens,
+                NOVITA_AR_FALLBACK_MIN_TOKENS,
+                NOVITA_AR_FALLBACK_MAX_TOKENS,
+            )
+            _logged_fallback = True
+        _flashinfer_allreduce_fallback(
+            allreduce_in=allreduce_in,
+            residual=residual,
+            rms_gamma=rms_gamma,
+            rms_eps=rms_eps,
+            workspace=workspace,
+            pattern_code=pattern_code,
+            launch_with_pdl=launch_with_pdl,
+            fp32_acc=fp32_acc,
+            use_oneshot=use_oneshot,
+            norm_out=norm_out,
+            quant_out=quant_out,
+            scale_out=scale_out,
+            scale_factor=scale_factor,
+        )
+        return
+
+    # --- novita fused kernel path ---
     if norm_out is None:
         actual_norm_out = allreduce_in
         residual_out = residual
