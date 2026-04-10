@@ -29,6 +29,20 @@ void novita_clear_qk_norm_workspace(
     torch::Tensor& workspace_ptrs, int64_t world_size,
     int64_t world_rank, int64_t max_tokens);
 
+// Fused QK-Norm + RoPE + FP8 quantization + KV cache store (with TP)
+void fused_qk_norm_rope_fp8_kvstore(
+    torch::Tensor& qkv, int64_t num_heads_q, int64_t num_heads_k,
+    int64_t num_heads_v, int64_t num_heads_q_total, int64_t num_heads_k_total,
+    int64_t head_dim, double eps,
+    torch::Tensor& q_weight, torch::Tensor& k_weight,
+    bool is_neox, torch::Tensor& position_ids,
+    int64_t rotary_dim, torch::Tensor& cos_sin_cache,
+    torch::Tensor& q_output, torch::Tensor& q_scale,
+    torch::Tensor& k_cache, torch::Tensor& v_cache,
+    torch::Tensor& slot_mapping, torch::Tensor& k_scale, torch::Tensor& v_scale,
+    torch::Tensor& workspace_ptrs, int64_t world_size, int64_t world_rank,
+    int64_t max_tokens, int64_t epoch);
+
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "allreduce_fusion(Tensor! allreduce_in, Tensor! residual_in, "
@@ -55,6 +69,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "clear_qk_norm_workspace(Tensor! workspace_ptrs, "
       "int world_size, int world_rank, int max_tokens) -> ()");
   ops.impl("clear_qk_norm_workspace", torch::kCUDA, &novita_clear_qk_norm_workspace);
+
+  ops.def(
+      "fused_qk_norm_rope_fp8_kvstore(Tensor! qkv, "
+      "int num_heads_q, int num_heads_k, int num_heads_v, "
+      "int num_heads_q_total, int num_heads_k_total, "
+      "int head_dim, float eps, "
+      "Tensor q_weight, Tensor k_weight, "
+      "bool is_neox, Tensor position_ids, "
+      "int rotary_dim, Tensor cos_sin_cache, "
+      "Tensor! q_output, Tensor q_scale, "
+      "Tensor! k_cache, Tensor! v_cache, "
+      "Tensor slot_mapping, Tensor k_scale, Tensor v_scale, "
+      "Tensor workspace_ptrs, int world_size, int world_rank, "
+      "int max_tokens, int epoch) -> ()");
+  ops.impl("fused_qk_norm_rope_fp8_kvstore", torch::kCUDA,
+           &fused_qk_norm_rope_fp8_kvstore);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
