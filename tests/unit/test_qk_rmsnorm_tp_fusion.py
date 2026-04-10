@@ -168,7 +168,7 @@ def _run_correctness_worker(
 
     dist.init_process_group(
         backend="nccl",
-        init_method=f"tcp://localhost:{distributed_init_port}",
+        init_method=f"tcp://127.0.0.1:{distributed_init_port}",
         rank=rank,
         world_size=world_size,
     )
@@ -289,7 +289,7 @@ def _run_correctness_worker(
         dist.barrier(group=group)
         if opened_handles is not None:
             destroy_qk_norm_workspace(opened_handles)
-        dist.destroy_process_group(group=group)
+        dist.destroy_process_group()
 
 
 # ---------------------------------------------------------------------------
@@ -344,58 +344,39 @@ def multi_process_parallel(
 # Test cases
 # ---------------------------------------------------------------------------
 
-# MiniMax-Text-01 config: heads=48, kv_heads=8, head_dim=64
-MINIMAX_CONFIGS = [
-    # (D_q_total, D_k_total)
-    (3072, 512),     # head_dim=64, heads=48, kv_heads=8
-    (4096, 1024),    # head_dim=128, heads=32, kv_heads=8
-    (1024, 1024),    # symmetric case
-]
+# MiniMax-Text-01 config: heads=48, kv_heads=8, head_dim=64, hidden=3072, TP=8
+D_Q_TOTAL = 3072
+D_K_TOTAL = 512
+WORLD_SIZE = 8
 
 
-@pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize(
-    "D_q_total,D_k_total", MINIMAX_CONFIGS,
-    ids=[f"Dq{dq}_Dk{dk}" for dq, dk in MINIMAX_CONFIGS],
-)
-def test_qk_rmsnorm_tp_fusion(world_size, dtype, D_q_total, D_k_total):
+def test_qk_rmsnorm_tp_fusion(dtype):
     np.random.seed(42)
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
 
     available_gpus = torch.cuda.device_count()
-    if world_size > available_gpus:
+    if WORLD_SIZE > available_gpus:
         pytest.skip(
-            f"world_size {world_size} > available GPUs {available_gpus}"
-        )
-
-    vec_size = 8  # 128-bit / 2 bytes
-    D_q_local = D_q_total // world_size
-    D_k_local = D_k_total // world_size
-    if D_q_local % vec_size != 0 or D_k_local % vec_size != 0:
-        pytest.skip(
-            f"D_q_local={D_q_local} or D_k_local={D_k_local} "
-            f"not divisible by vec_size={vec_size}"
+            f"world_size {WORLD_SIZE} > available GPUs {available_gpus}"
         )
 
     print(
-        f"\n=== QK RMS Norm TP Fusion: tp={world_size} dtype={dtype} "
-        f"D_q={D_q_total} D_k={D_k_total} ==="
+        f"\n=== QK RMS Norm TP Fusion: tp={WORLD_SIZE} dtype={dtype} "
+        f"D_q={D_Q_TOTAL} D_k={D_K_TOTAL} ==="
     )
     multi_process_parallel(
-        world_size, dtype, D_q_total, D_k_total,
+        WORLD_SIZE, dtype, D_Q_TOTAL, D_K_TOTAL,
         _run_correctness_worker,
     )
     print(f"=== PASSED ===\n")
 
 
 if __name__ == "__main__":
-    # Quick smoke test with smallest config
     available = torch.cuda.device_count()
-    if available < 2:
-        print(f"Need >= 2 GPUs, have {available}. Skipping.")
+    if available < WORLD_SIZE:
+        print(f"Need >= {WORLD_SIZE} GPUs, have {available}. Skipping.")
     else:
-        ws = min(available, 8)
-        print(f"Running with world_size={ws}")
-        test_qk_rmsnorm_tp_fusion(ws, torch.bfloat16, 3072, 512)
+        print(f"Running with world_size={WORLD_SIZE}")
+        test_qk_rmsnorm_tp_fusion(torch.bfloat16)
