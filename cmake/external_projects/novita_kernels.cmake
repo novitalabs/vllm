@@ -3,6 +3,7 @@
 
 set(NOVITA_SRCS
     "${CMAKE_CURRENT_SOURCE_DIR}/csrc/novita/allreduce_fusion_wrapper.cu"
+    "${CMAKE_CURRENT_SOURCE_DIR}/csrc/novita/qk_rmsnorm_tp_wrapper.cu"
     "${CMAKE_CURRENT_SOURCE_DIR}/csrc/novita/torch_bindings.cpp")
 
 set(NOVITA_GPU_FLAGS ${VLLM_GPU_FLAGS})

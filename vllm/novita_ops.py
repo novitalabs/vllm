@@ -289,5 +289,74 @@ def call_novita_fused_allreduce_norm_fake(
     pass
 
 
+# ---------------------------------------------------------------------------
+# Fused QK RMS Norm with TP variance all-reduce
+# ---------------------------------------------------------------------------
+
+_qk_norm_epoch = 0
+
+
+def novita_fused_qk_rmsnorm_tp(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    q_eps: float,
+    k_eps: float,
+    workspace_ptrs: torch.Tensor,
+    world_size: int,
+    rank: int,
+    max_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused QK RMS Norm with TP variance all-reduce via NVLink.
+
+    Replaces MiniMaxText01RMSNormTP.forward_qk with a single CUDA kernel
+    that fuses cast + variance + cross-GPU exchange + normalize.
+
+    Args:
+        q: [num_tokens, D_q_local] input query tensor (bf16/fp16)
+        k: [num_tokens, D_k_local] input key tensor (bf16/fp16)
+        q_weight: [D_q_local] RMS norm weight for q
+        k_weight: [D_k_local] RMS norm weight for k
+        q_eps: epsilon for q RMS norm
+        k_eps: epsilon for k RMS norm
+        workspace_ptrs: [world_size] int64 tensor of NVLink-accessible buffer pointers
+        world_size: tensor parallel world size
+        rank: current rank
+        max_tokens: maximum tokens the workspace was allocated for
+
+    Returns:
+        (q_out, k_out) normalized tensors with same shape and dtype as inputs
+    """
+    global _qk_norm_epoch
+    _qk_norm_epoch += 1
+
+    q_out = torch.empty_like(q)
+    k_out = torch.empty_like(k)
+
+    torch.ops._novita_C.qk_rmsnorm_tp(
+        q, k, q_out, k_out,
+        q_weight, k_weight,
+        q_eps, k_eps,
+        workspace_ptrs,
+        world_size, rank,
+        max_tokens, _qk_norm_epoch,
+    )
+
+    return q_out, k_out
+
+
+def novita_clear_qk_norm_workspace(
+    workspace_ptrs: torch.Tensor,
+    world_size: int,
+    rank: int,
+    max_tokens: int,
+) -> None:
+    """Clear the QK norm workspace (call once before first use)."""
+    torch.ops._novita_C.clear_qk_norm_workspace(
+        workspace_ptrs, world_size, rank, max_tokens,
+    )
+
+
 if _novita_available:
     register_novita_ops()
