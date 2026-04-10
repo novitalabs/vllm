@@ -26,8 +26,10 @@ _FP8_MIN_SCALING_FACTOR = 1.0 / (_FP8_MAX * 512.0)
 
 # Try sgl_kernel fused FP8 quant (scale + quant in one kernel)
 _SGL_FP8_QUANT_AVAILABLE = False
+_SGL_FP8_GROUP_QUANT_AVAILABLE = False
 try:
     from sgl_kernel import sgl_per_token_quant_fp8 as _sgl_per_token_quant_fp8
+
     _SGL_FP8_QUANT_AVAILABLE = True
 
     # Register as custom op so torch.compile keeps it as opaque node (no graph break)
@@ -44,6 +46,57 @@ try:
         out_q = torch.empty_like(x, dtype=_FP8_DTYPE)
         out_s = torch.empty(*x.shape[:-1], 1, device=x.device, dtype=torch.float32)
         return out_q, out_s
+
+    try:
+        from sgl_kernel import (
+            sgl_per_token_group_quant_fp8 as _sgl_per_token_group_quant_fp8,
+        )
+
+        _SGL_FP8_GROUP_QUANT_AVAILABLE = True
+
+        _SGL_GROUP_QUANT_EPS = 1e-10
+
+        @torch.library.custom_op("vllm::sgl_fused_fp8_group_quant", mutates_args=())
+        def _sgl_fused_fp8_group_quant(
+            x: torch.Tensor, group_size: int, use_ue8m0: bool
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            x_contiguous = x.contiguous()
+            orig_shape = x_contiguous.shape
+            hidden = orig_shape[-1]
+            x_2d = x_contiguous.reshape(-1, hidden)
+            out_q = torch.empty_like(x_2d, dtype=_FP8_DTYPE)
+            num_groups = hidden // group_size
+            out_s = torch.empty(
+                x_2d.shape[0], num_groups, device=x.device, dtype=torch.float32
+            )
+            # v1 kernel only: avoids importing sglang for env-based v2 toggle
+            _sgl_per_token_group_quant_fp8(
+                x_2d,
+                out_q,
+                out_s,
+                group_size,
+                _SGL_GROUP_QUANT_EPS,
+                float(_FP8_MIN),
+                float(_FP8_MAX),
+                scale_ue8m0=use_ue8m0,
+                enable_v2=False,
+            )
+            return out_q.view(orig_shape), out_s.view(orig_shape[:-1] + (num_groups,))
+
+        @_sgl_fused_fp8_group_quant.register_fake
+        def _sgl_fused_fp8_group_quant_fake(
+            x: torch.Tensor, group_size: int, use_ue8m0: bool
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            hidden = x.shape[-1]
+            num_groups = hidden // group_size
+            out_q = torch.empty_like(x, dtype=_FP8_DTYPE)
+            out_s = torch.empty(
+                *x.shape[:-1], num_groups, device=x.device, dtype=torch.float32
+            )
+            return out_q, out_s
+
+    except ImportError:
+        pass
 
 except ImportError:
     pass
@@ -128,6 +181,16 @@ class QuantFP8(CustomOp):
         if self.is_group_quant and not self.static:
             assert scale is None, "Dynamic group quantization does not use scale"
 
+            if (
+                _SGL_FP8_GROUP_QUANT_AVAILABLE
+                and x.shape[-1] % self.group_size == 0
+                and not self.column_major_scales
+                and not self.tma_aligned_scales
+            ):
+                return torch.ops.vllm.sgl_fused_fp8_group_quant(
+                    x, self.group_size, bool(self.use_ue8m0)
+                )
+
             return fp8_utils.per_token_group_quant_fp8(
                 x,
                 group_size=self.group_size,
@@ -209,6 +272,16 @@ class QuantFP8(CustomOp):
     ):
         if self.is_group_quant and not self.static:
             assert scale is None, "Dynamic group quantization does not use scale"
+            # sgl_kernel fused per-token-group quant (same motivation as per-token path)
+            if (
+                _SGL_FP8_GROUP_QUANT_AVAILABLE
+                and x.shape[-1] % self.group_size == 0
+                and not self.column_major_scales
+                and not self.tma_aligned_scales
+            ):
+                return torch.ops.vllm.sgl_fused_fp8_group_quant(
+                    x, self.group_size, bool(self.use_ue8m0)
+                )
             return self._quantize_group_native(x)
 
         assert (scale is not None) == self.static
