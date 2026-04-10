@@ -800,6 +800,25 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             max_token_num=self.max_token_num,
         )
 
+        if config.compilation_config.pass_config.enable_novita_allreduce_rms_fusion:
+            from vllm.novita_ops import is_novita_available
+
+            if is_novita_available():
+                global flashinfer_trtllm_fused_allreduce_norm
+                flashinfer_trtllm_fused_allreduce_norm = (
+                    torch.ops.vllm.novita_fused_allreduce_norm.default
+                )
+                logger.info(
+                    "Using novita optimized allreduce fusion kernel "
+                    "(replacing flashinfer)"
+                )
+            else:
+                logger.warning(
+                    "enable_novita_allreduce_rms_fusion is set but "
+                    "vllm._novita_C is not available. Falling back "
+                    "to flashinfer kernel."
+                )
+
         self.register_patterns()
         self.dump_patterns(config, self.patterns)
 

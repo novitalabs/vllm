@@ -134,6 +134,11 @@ class PassConfig:
     """Enable flashinfer allreduce fusion."""
     enable_qk_norm_rope_fusion: bool = False
     """Enable fused Q/K RMSNorm + RoPE pass."""
+    enable_novita_allreduce_rms_fusion: bool = False
+    """Use novita's optimized allreduce+rms_norm kernel instead of
+    flashinfer's. Requires _novita_C to be built and flashinfer for
+    workspace management. Only effective when fuse_allreduce_rms is also
+    enabled."""
 
     # ROCm/AITER specific fusions
     fuse_act_padding: bool = None  # type: ignore[assignment]
