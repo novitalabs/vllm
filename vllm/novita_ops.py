@@ -2,14 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Novita fused kernels (vllm._novita_C):
-  AllReduce + RMSNorm + Residual Add (+ optional FP8/FP4 quantization)
+  1) TP QK-Norm + RoPE + FP8 quantization + KV cache store
+  2) AllReduce + RMSNorm + Residual Add (+ optional FP8/FP4 quantization)
 
 Isolated in a separate .so from the main vLLM C extensions.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
+import torch.distributed as dist
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -38,6 +42,13 @@ def register_novita_ops() -> None:
     from vllm.utils.torch_utils import direct_register_custom_op
 
     direct_register_custom_op(
+        op_name="novita_fused_attn",
+        op_func=novita_fused_attn,
+        mutates_args=["output"],
+        fake_impl=novita_fused_attn_fake,
+    )
+
+    direct_register_custom_op(
         op_name="novita_fused_allreduce_norm",
         op_func=call_novita_fused_allreduce_norm,
         mutates_args=[
@@ -49,6 +60,297 @@ def register_novita_ops() -> None:
         ],
         fake_impl=call_novita_fused_allreduce_norm_fake,
     )
+
+
+# ---------------------------------------------------------------------------
+# Custom op: novita_fused_attn
+#
+# Encapsulates get_attention_context + fused CUDA kernel + attention-only
+# forward into a single opaque op so torch.compile / cudagraph can trace
+# through the MiniMaxM2 fused path without graph breaks.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _QKNormTPWorkspace:
+    workspace_ptrs: torch.Tensor
+    local_buf: torch.Tensor
+    max_tokens: int
+    world_size: int
+    rank: int
+    epoch: int = 0
+
+    def next_epoch(self) -> int:
+        self.epoch += 1
+        return self.epoch
+
+
+_qk_norm_tp_workspaces: dict[tuple[int, int, int, int], _QKNormTPWorkspace] = {}
+_logged_fused_attn_layers: set[str] = set()
+
+
+def _create_qk_norm_tp_workspace(
+    *,
+    device: torch.device,
+    group: object,
+    world_size: int,
+    rank: int,
+    max_tokens: int,
+) -> _QKNormTPWorkspace:
+    from vllm.distributed.device_communicators.cuda_wrapper import (
+        CudaRTLibrary,
+        cudaIpcMemHandle_t,
+    )
+
+    buf_size = world_size * max_tokens * 3
+    local_buf = torch.zeros(buf_size, dtype=torch.float32, device=device)
+
+    if world_size == 1:
+        workspace_ptrs = torch.tensor(
+            [local_buf.data_ptr()], dtype=torch.int64, device=device
+        )
+        return _QKNormTPWorkspace(
+            workspace_ptrs=workspace_ptrs,
+            local_buf=local_buf,
+            max_tokens=max_tokens,
+            world_size=world_size,
+            rank=rank,
+        )
+
+    cudart = CudaRTLibrary()
+    local_handle = bytes(cudart.cudaIpcGetMemHandle(local_buf.data_ptr()).internal)
+    gathered_handles: list[bytes | None] = [None] * world_size
+    dist.all_gather_object(gathered_handles, local_handle, group=group)
+
+    peer_ptrs: list[int] = []
+    for peer_rank, handle_bytes in enumerate(gathered_handles):
+        assert handle_bytes is not None
+        if peer_rank == rank:
+            peer_ptrs.append(local_buf.data_ptr())
+            continue
+
+        handle = cudaIpcMemHandle_t()
+        handle.internal[:] = handle_bytes
+        peer_ptrs.append(cudart.cudaIpcOpenMemHandle(handle).value)
+
+    workspace_ptrs = torch.tensor(peer_ptrs, dtype=torch.int64, device=device)
+    return _QKNormTPWorkspace(
+        workspace_ptrs=workspace_ptrs,
+        local_buf=local_buf,
+        max_tokens=max_tokens,
+        world_size=world_size,
+        rank=rank,
+    )
+
+
+def _get_qk_norm_tp_workspace(
+    *,
+    device: torch.device,
+    group: object,
+    world_size: int,
+    rank: int,
+    max_tokens: int,
+) -> _QKNormTPWorkspace:
+    cache_key = (id(group), device.index or 0, world_size, max_tokens)
+    workspace = _qk_norm_tp_workspaces.get(cache_key)
+    if workspace is not None:
+        return workspace
+
+    workspace = _create_qk_norm_tp_workspace(
+        device=device,
+        group=group,
+        world_size=world_size,
+        rank=rank,
+        max_tokens=max_tokens,
+    )
+    novita_clear_qk_norm_workspace(
+        workspace.workspace_ptrs, world_size, rank, max_tokens
+    )
+    _qk_norm_tp_workspaces[cache_key] = workspace
+    return workspace
+
+
+def _tp_qk_rmsnorm_fallback(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    group: object,
+    world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    orig_dtype = q.dtype
+    q_fp32 = q.to(torch.float32)
+    k_fp32 = k.to(torch.float32)
+    q_var = q_fp32.pow(2).mean(dim=-1, keepdim=True)
+    k_var = k_fp32.pow(2).mean(dim=-1, keepdim=True)
+
+    if world_size > 1:
+        qk_var = torch.cat([q_var, k_var], dim=-1)
+        dist.all_reduce(qk_var, group=group)
+        qk_var /= world_size
+        q_var, k_var = qk_var.chunk(2, dim=-1)
+
+    q_out = q_fp32 * torch.rsqrt(q_var + eps) * q_weight.to(torch.float32)
+    k_out = k_fp32 * torch.rsqrt(k_var + eps) * k_weight.to(torch.float32)
+    return q_out.to(orig_dtype), k_out.to(orig_dtype)
+
+
+def novita_fused_attn(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    num_heads_q_total: int,
+    num_heads_k_total: int,
+    head_dim: int,
+    q_size: int,
+    kv_size: int,
+    eps: float,
+    rotary_dim: int,
+    max_tokens: int,
+    is_neox: bool = True,
+) -> None:
+    """Fused TP QK-norm + RoPE + FP8 quant + KV-cache-store + attention."""
+    from vllm.distributed import get_tp_group
+    from vllm.model_executor.layers.attention.attention import (
+        get_attention_context,
+        unified_attention_with_output,
+        unified_kv_cache_update,
+    )
+
+    tp_group = get_tp_group()
+    world_size = tp_group.world_size
+    rank = tp_group.rank_in_group
+    num_tokens = qkv.shape[0]
+    if num_tokens > max_tokens:
+        raise ValueError(
+            f"novita_fused_attn got {num_tokens=} > configured {max_tokens=}"
+        )
+
+    _, _, kv_cache, slot_mapping = get_attention_context(layer_name)
+
+    if kv_cache.numel() == 0 or slot_mapping is None:
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        q, k = _tp_qk_rmsnorm_fallback(
+            q=q,
+            k=k,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            eps=eps,
+            group=tp_group.device_group,
+            world_size=world_size,
+        )
+        torch.ops._C.rotary_embedding(
+            positions, q, k, head_dim, cos_sin_cache, is_neox
+        )
+
+        q_view = q.view(-1, num_heads_q, head_dim)
+        k_view = k.view(-1, num_heads_k, head_dim)
+        v_view = v.view(-1, num_heads_v, head_dim)
+        output_view = output.view(-1, num_heads_q, head_dim)
+
+        kv_dep = unified_kv_cache_update(k_view, v_view, layer_name)
+        unified_attention_with_output(
+            q_view,
+            k_view,
+            v_view,
+            output_view,
+            layer_name,
+            kv_cache_dummy_dep=kv_dep,
+        )
+        return
+
+    key_cache, value_cache = kv_cache.unbind(0)
+    workspace = _get_qk_norm_tp_workspace(
+        device=qkv.device,
+        group=tp_group.cpu_group,
+        world_size=world_size,
+        rank=rank,
+        max_tokens=max_tokens,
+    )
+    epoch = workspace.next_epoch()
+
+    if layer_name not in _logged_fused_attn_layers:
+        logger.info(
+            "novita fused kernel ACTIVE for layer %s (tp=%d, max_tokens=%d)",
+            layer_name,
+            world_size,
+            max_tokens,
+        )
+        _logged_fused_attn_layers.add(layer_name)
+
+    q_output = torch.empty(
+        num_tokens, q_size, dtype=torch.float8_e4m3fn, device=qkv.device
+    )
+    torch.ops._novita_C.fused_qk_norm_rope_fp8_kvstore(
+        qkv.contiguous(),
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        num_heads_q_total,
+        num_heads_k_total,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        is_neox,
+        positions,
+        rotary_dim,
+        cos_sin_cache,
+        q_output,
+        q_scale,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        k_scale,
+        v_scale,
+        workspace.workspace_ptrs,
+        world_size,
+        rank,
+        max_tokens,
+        epoch,
+    )
+
+    q_view = q_output.view(-1, num_heads_q, head_dim)
+    output_view = output.view(-1, num_heads_q, head_dim)
+    unified_attention_with_output(q_view, q_view, q_view, output_view, layer_name)
+
+
+def novita_fused_attn_fake(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    num_heads_q_total: int,
+    num_heads_k_total: int,
+    head_dim: int,
+    q_size: int,
+    kv_size: int,
+    eps: float,
+    rotary_dim: int,
+    max_tokens: int,
+    is_neox: bool = True,
+) -> None:
+    return
 
 
 # ---------------------------------------------------------------------------

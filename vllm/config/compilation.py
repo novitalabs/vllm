@@ -134,6 +134,9 @@ class PassConfig:
     """Enable flashinfer allreduce fusion."""
     enable_qk_norm_rope_fusion: bool = False
     """Enable fused Q/K RMSNorm + RoPE pass."""
+    enable_qk_norm_rope_fp8_kvstore_fusion: bool = False
+    """Enable fused Q/K RMSNorm + RoPE + FP8 quant + KV cache store
+    (novita kernel)."""
     enable_novita_allreduce_rms_fusion: bool = False
     """Use novita's optimized allreduce+rms_norm kernel instead of
     flashinfer's. Requires _novita_C to be built and flashinfer for
@@ -1090,6 +1093,8 @@ class CompilationConfig:
                         self.pass_config.fuse_rope_kvcache = False
                     self.splitting_ops.append("vllm::unified_kv_cache_update")
                     self.splitting_ops.append("vllm::unified_mla_kv_cache_update")
+                    if self.pass_config.enable_qk_norm_rope_fp8_kvstore_fusion:
+                        self.splitting_ops.append("vllm::novita_fused_attn")
 
             elif len(self.splitting_ops) == 0:
                 if (

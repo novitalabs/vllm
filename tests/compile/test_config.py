@@ -295,6 +295,22 @@ def test_moe_splitting_ops_deepep_ht_inductor_partition():
     ]
 
 
+def test_novita_fused_attn_added_to_splitting_ops():
+    config = VllmConfig(
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            pass_config=PassConfig(
+                enable_qk_norm_rope_fp8_kvstore_fusion=True,
+            ),
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+        )
+    )
+
+    splitting_ops = config.compilation_config.splitting_ops
+    assert splitting_ops is not None
+    assert "vllm::novita_fused_attn" in splitting_ops
+
+
 def test_should_split():
     import torch
 

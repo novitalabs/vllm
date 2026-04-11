@@ -31,7 +31,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -207,6 +207,7 @@ class MiniMaxM2Attention(nn.Module):
             max_position=max_position_embeddings,
             rope_parameters=rope_parameters,
         )
+        self._is_neox = self.rotary_emb.is_neox_style
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -224,6 +225,34 @@ class MiniMaxM2Attention(nn.Module):
         self.k_norm = MiniMaxText01RMSNormTP(
             self.head_dim * self.total_num_kv_heads, eps=rms_norm_eps
         )
+        self._rotary_dim = rotary_dim
+
+        vllm_config = get_current_vllm_config()
+        pass_config = vllm_config.compilation_config.pass_config
+        self._max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self._use_fused_fp8_kvstore = (
+            pass_config.enable_qk_norm_rope_fp8_kvstore_fusion
+        )
+        if self._use_fused_fp8_kvstore:
+            from vllm.novita_ops import is_novita_available
+
+            assert is_novita_available(), (
+                "novita kernels (_novita_C) not available but "
+                "enable_qk_norm_rope_fp8_kvstore_fusion is set"
+            )
+            assert self.attn.kv_cache_dtype in {"fp8", "fp8_e4m3"}, (
+                "MiniMaxM2 novita fused kvstore requires fp8 kv cache, got "
+                f"{self.attn.kv_cache_dtype}"
+            )
+            assert self.attn._q_scale.numel() == 1, (
+                "MiniMaxM2 novita fused kvstore requires scalar q_scale"
+            )
+            assert self.attn._k_scale.numel() == 1, (
+                "MiniMaxM2 novita fused kvstore requires scalar k_scale"
+            )
+            assert self.attn._v_scale.numel() == 1, (
+                "MiniMaxM2 novita fused kvstore requires scalar v_scale"
+            )
 
     def forward(
         self,
@@ -231,6 +260,9 @@ class MiniMaxM2Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        if self._use_fused_fp8_kvstore:
+            return self._forward_fused(positions, hidden_states, qkv)
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = MiniMaxText01RMSNormTP.forward_qk(
             self.q_norm, self.k_norm, q.contiguous(), k.contiguous()
@@ -238,6 +270,49 @@ class MiniMaxM2Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
+        return output
+
+    def _forward_fused(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        qkv: torch.Tensor,
+    ) -> torch.Tensor:
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        if cos_sin_cache.dtype != torch.bfloat16:
+            cos_sin_cache = cos_sin_cache.to(torch.bfloat16)
+
+        output = torch.empty(
+            qkv.shape[0],
+            self.num_heads * self.head_dim,
+            dtype=hidden_states.dtype,
+            device=qkv.device,
+        )
+        torch.ops.vllm.novita_fused_attn(
+            qkv,
+            positions,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            cos_sin_cache,
+            self.attn._q_scale,
+            self.attn._k_scale,
+            self.attn._v_scale,
+            output,
+            self.attn.layer_name,
+            self.num_heads,
+            self.num_kv_heads,
+            self.num_kv_heads,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            self.head_dim,
+            self.q_size,
+            self.kv_size,
+            self.q_norm.variance_epsilon,
+            self._rotary_dim,
+            self._max_tokens,
+            self._is_neox,
+        )
+        output, _ = self.o_proj(output)
         return output
 
 
