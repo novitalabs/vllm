@@ -19,7 +19,9 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
+from vllm.sampling_params import StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import (
     Tool,
@@ -72,6 +74,106 @@ class MinimaxM2ToolParser(ToolParser):
         logger.debug(
             "vLLM Successfully import tool parser %s !", self.__class__.__name__
         )
+
+    def adjust_request(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        request = super().adjust_request(request)
+
+        if request.structured_outputs is not None:
+            return request
+
+        if request.tools and request.tool_choice in ("auto", None):
+            tag_json = self._build_structural_tag(request.tools)
+            if tag_json is not None:
+                request.structured_outputs = StructuredOutputsParams(
+                    structural_tag=tag_json
+                )
+
+        if request.tools and request.tool_choice != "none":
+            request.skip_special_tokens = False
+
+        return request
+
+    def _build_structural_tag(self, tools) -> str | None:
+        """Build a structural_tag JSON from tools for guided decoding.
+
+        Uses triggered_tags: when the model generates <minimax:tool_call>,
+        the grammar constrains the content within to only produce valid
+        tool names and parameter names. Free text outside tool call blocks
+        (including <think>...</think>) is completely unconstrained.
+        """
+        if not tools:
+            return None
+
+        trigger = '<invoke name="'
+
+        tags = []
+        for tool in tools:
+            name = tool.function.name
+            params = tool.function.parameters or {
+                "type": "object",
+                "properties": {},
+            }
+            properties = params.get("properties", {})
+            param_names = list(properties.keys())
+
+            # Build regex for parameters of this tool.
+            # Each parameter gets its own alternative with value constraints
+            # based on the schema (enum values are enforced, others are free).
+            if param_names:
+                per_param_alts = []
+                for p in param_names:
+                    p_escaped = re.escape(p)
+                    p_schema = properties.get(p, {})
+                    enum_vals = (
+                        p_schema.get("enum") if isinstance(p_schema, dict) else None
+                    )
+                    if enum_vals and all(isinstance(v, str) for v in enum_vals):
+                        # Constrain value to enum alternatives
+                        val_re = "|".join(re.escape(str(v)) for v in enum_vals)
+                        per_param_alts.append(
+                            r'<parameter name="'
+                            + p_escaped
+                            + r'">('
+                            + val_re
+                            + r")</parameter>\n"
+                        )
+                    else:
+                        # Free text value
+                        per_param_alts.append(
+                            r'<parameter name="' + p_escaped + r'">[^<]*</parameter>\n'
+                        )
+                param_re = "(" + "|".join(per_param_alts) + ")+"
+            else:
+                param_re = ""
+
+            tags.append(
+                {
+                    "type": "tag",
+                    "begin": f'<invoke name="{name}">',
+                    "content": {
+                        "type": "regex",
+                        "pattern": r"\n" + param_re,
+                    },
+                    "end": "</invoke>",
+                }
+            )
+
+        if not tags:
+            return None
+
+        structural_tag = {
+            "type": "structural_tag",
+            "format": {
+                "type": "triggered_tags",
+                "triggers": [trigger],
+                "tags": tags,
+                "at_least_one": False,
+                "stop_after_first": False,
+            },
+        }
+        return json.dumps(structural_tag)
 
     def _generate_tool_call_id(self) -> str:
         """Generate a unique tool call ID."""
@@ -147,7 +249,10 @@ class MinimaxM2ToolParser(ToolParser):
         return list(types)
 
     def _convert_param_value_with_types(
-        self, value: str, param_types: list[str]
+        self,
+        value: str,
+        param_types: list[str],
+        enum_values: list | None = None,
     ) -> Any:
         """
         Convert parameter value to the correct type based on a list of possible types.
@@ -156,16 +261,27 @@ class MinimaxM2ToolParser(ToolParser):
         Args:
             value: The string value to convert
             param_types: List of possible type strings
+            enum_values: Optional list of allowed enum values from the schema
 
         Returns:
             The converted value
         """
-        # Check if the VALUE itself indicates null (not just if null is allowed)
-        if value.lower() in ("null", "none", "nil"):
-            return None
+        # If schema defines an enum, try case-insensitive matching first.
+        # This handles the common case where the model generates "None"
+        # but the enum expects the string "none".
+        if enum_values is not None:
+            for ev in enum_values:
+                if isinstance(ev, str) and ev.lower() == value.lower():
+                    return ev
 
         # Normalize types
         normalized_types = [t.lower() for t in param_types]
+
+        # Only convert to None if null is explicitly allowed by the schema.
+        # When the schema type is "string" with an enum like ["none", ...],
+        # the value "None" should become the string "none", not null.
+        if value.lower() in ("null", "none", "nil") and "null" in normalized_types:
+            return None
 
         # Try each type in order of preference (most specific first, string as fallback)
         # Priority: integer > number > boolean > object > array > string
@@ -253,6 +369,14 @@ class MinimaxM2ToolParser(ToolParser):
 
         function_name = self._extract_name(name_match.group(1))
 
+        # Validate function name against available tools
+        if tools:
+            valid_names = {
+                tool.function.name for tool in tools if hasattr(tool, "function")
+            }
+            if function_name not in valid_names:
+                return None
+
         # Get parameter configuration
         param_config = {}
         if tools:
@@ -275,12 +399,26 @@ class MinimaxM2ToolParser(ToolParser):
                 param_name = self._extract_name(param_match.group(1))
                 param_value = param_match.group(2).strip()
 
+                # Strip surrounding quotes that the model sometimes adds
+                if len(param_value) >= 2 and (
+                    (param_value[0] == '"' and param_value[-1] == '"')
+                    or (param_value[0] == "'" and param_value[-1] == "'")
+                ):
+                    param_value = param_value[1:-1]
+
                 # Get parameter types (supports anyOf/oneOf/allOf)
                 param_type = self._get_param_types_from_config(param_name, param_config)
 
+                # Extract enum values if defined in schema
+                enum_values = None
+                if param_name in param_config:
+                    ps = param_config[param_name]
+                    if isinstance(ps, dict) and "enum" in ps:
+                        enum_values = ps["enum"]
+
                 # Convert value
                 param_dict[param_name] = self._convert_param_value_with_types(
-                    param_value, param_type
+                    param_value, param_type, enum_values
                 )
 
         return ToolCall(
