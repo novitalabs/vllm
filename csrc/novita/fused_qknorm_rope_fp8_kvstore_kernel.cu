@@ -155,25 +155,9 @@ __global__ void fusedQKNormRopeFP8KVStoreKernel(
     for (int i = 0; i < ELEMS_PER_THREAD; i++) elements[i] = 0.0f;
   }
 
-  // ====== V heads: no norm/RoPE, just FP8 + cache store, then return ======
-  if (headType == V_HEAD) {
-    int64_t const cacheSlot = slot_mapping[tokenIdx];
-    if (cacheSlot < 0) return;
-
-    int64_t const cacheOffset = cacheSlot * kv_cache_stride +
-                                static_cast<int64_t>(headIdx) * HEAD_DIM +
-                                laneId * ELEMS_PER_THREAD;
-    float v_scale = *v_scale_ptr;
-    uint32_t packed = 0;
-#pragma unroll
-    for (int i = 0; i < ELEMS_PER_THREAD; i++) {
-      __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(elements[i] / v_scale);
-      packed |=
-          (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8)) << (i * 8));
-    }
-    *reinterpret_cast<uint32_t*>(&v_cache[cacheOffset]) = packed;
-    return;
-  }
+  // NOTE: V heads skip norm/RoPE but must NOT return early — they need
+  // to participate in __syncthreads() during Phases 1-2. V store happens
+  // after Phase 2.
 
   // ====== Phase 1: Per-warp sum of squares + block reduce ======
 
@@ -187,7 +171,7 @@ __global__ void fusedQKNormRopeFP8KVStoreKernel(
   }
 
   // Block-level reduce: sum per-warp SS into total Q SS and K SS
-  __shared__ float s_warp_ss[16];  // room for up to 16 warps
+  __shared__ float s_warp_ss[32];  // room for up to 32 warps (1024 threads)
   __shared__ float s_q_inv_rms, s_k_inv_rms;
 
   if (laneId == 0 && headType != IDLE) {
@@ -255,6 +239,23 @@ __global__ void fusedQKNormRopeFP8KVStoreKernel(
 
   // ====== Phase 3: Normalize + RoPE + FP8 write ======
 
+  // V heads: no norm/RoPE, just FP8 + cache store
+  if (headType == V_HEAD) {
+    int64_t const cacheSlot = slot_mapping[tokenIdx];
+    if (cacheSlot >= 0) {
+      int64_t const cacheOffset = cacheSlot * kv_cache_stride +
+                                  static_cast<int64_t>(headIdx) * HEAD_DIM +
+                                  laneId * ELEMS_PER_THREAD;
+      float v_scale = *v_scale_ptr;
+#pragma unroll
+      for (int i = 0; i < ELEMS_PER_THREAD; i++) {
+        __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(elements[i] / v_scale);
+        v_cache[cacheOffset + i] = fp8;
+      }
+    }
+    return;
+  }
+
   if (headType == IDLE) return;
 
   // Apply RMSNorm weights
@@ -289,7 +290,7 @@ __global__ void fusedQKNormRopeFP8KVStoreKernel(
 
     if constexpr (IS_NEOX) {
       int const half_rotary_lanes = rotary_lanes / 2;
-      unsigned int active_mask = (1u << rotary_lanes) - 1;
+      unsigned int active_mask = (rotary_lanes >= 32) ? 0xFFFFFFFFu : ((1u << rotary_lanes) - 1);
       int base_half = (laneId * ELEMS_PER_THREAD) % half_rotary;
 
       // Vectorized cos/sin load (ELEMS_PER_THREAD BF16 values)
@@ -340,14 +341,11 @@ __global__ void fusedQKNormRopeFP8KVStoreKernel(
         static_cast<int64_t>(headIdx) * HEAD_DIM +
         laneId * ELEMS_PER_THREAD;
 
-    uint32_t packed = 0;
 #pragma unroll
     for (int i = 0; i < ELEMS_PER_THREAD; i++) {
       __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(elements[i] / q_scale);
-      packed |= (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8))
-                 << (i * 8));
+      q_output[outOffset + i] = fp8;
     }
-    *reinterpret_cast<uint32_t*>(&q_output[outOffset]) = packed;
   } else {
     // K head -> paged KV cache
     int64_t const cacheSlot = slot_mapping[tokenIdx];
@@ -358,14 +356,11 @@ __global__ void fusedQKNormRopeFP8KVStoreKernel(
                                 static_cast<int64_t>(headIdx) * HEAD_DIM +
                                 laneId * ELEMS_PER_THREAD;
 
-    uint32_t packed = 0;
 #pragma unroll
     for (int i = 0; i < ELEMS_PER_THREAD; i++) {
       __nv_fp8_e4m3 fp8 = __nv_fp8_e4m3(elements[i] / k_scale);
-      packed |= (static_cast<uint32_t>(*reinterpret_cast<uint8_t*>(&fp8))
-                 << (i * 8));
+      k_cache[cacheOffset + i] = fp8;
     }
-    *reinterpret_cast<uint32_t*>(&k_cache[cacheOffset]) = packed;
   }
 }
 
