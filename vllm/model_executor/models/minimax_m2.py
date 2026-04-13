@@ -57,6 +57,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.novita_ops import ensure_novita_qk_workspace_initialized
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import EagleModelMixin, SupportsEagle3, SupportsLoRA, SupportsPP
@@ -252,6 +253,10 @@ class MiniMaxM2Attention(nn.Module):
             )
             assert self.attn._v_scale.numel() == 1, (
                 "MiniMaxM2 novita fused kvstore requires scalar v_scale"
+            )
+            ensure_novita_qk_workspace_initialized(
+                device=self.q_norm.weight.device if self.q_norm.weight.is_cuda else None,
+                max_tokens=self._max_tokens,
             )
 
     def forward(

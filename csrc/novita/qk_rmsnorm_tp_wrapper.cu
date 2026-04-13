@@ -21,7 +21,7 @@ void launch_qk_rmsnorm_tp(torch::Tensor& q_in, torch::Tensor& k_in, torch::Tenso
                            torch::Tensor& k_out, torch::Tensor& q_weight, torch::Tensor& k_weight,
                            double q_eps, double k_eps, torch::Tensor& workspace_ptrs,
                            int64_t world_size, int64_t world_rank, int64_t max_tokens,
-                           int64_t epoch, cudaStream_t stream) {
+                           torch::Tensor& epoch_state, cudaStream_t stream) {
   int num_tokens = q_in.size(0);
   int D_q_local = q_in.size(1);
   int D_k_local = k_in.size(1);
@@ -33,7 +33,7 @@ void launch_qk_rmsnorm_tp(torch::Tensor& q_in, torch::Tensor& k_in, torch::Tenso
       reinterpret_cast<const T*>(k_weight.data_ptr()), static_cast<float>(q_eps),
       static_cast<float>(k_eps), D_q_local, D_k_local, static_cast<int>(world_size), num_tokens,
       static_cast<int>(max_tokens), reinterpret_cast<void**>(workspace_ptrs.data_ptr()),
-      static_cast<int>(world_rank), static_cast<int>(epoch), stream);
+      static_cast<int>(world_rank), reinterpret_cast<int*>(epoch_state.data_ptr<int32_t>()), stream);
 
   TORCH_CHECK(status == cudaSuccess, "fused_qk_rmsnorm_tp failed: ", cudaGetErrorString(status));
 }
@@ -49,11 +49,17 @@ void novita_qk_rmsnorm_tp(torch::Tensor& q_in,              // [num_tokens, D_q_
                            double q_eps, double k_eps,
                            torch::Tensor& workspace_ptrs,    // [world_size] int64 ptrs
                            int64_t world_size, int64_t world_rank,
-                           int64_t max_tokens, int64_t epoch) {
+                           int64_t max_tokens, torch::Tensor& epoch_state) {
   TORCH_CHECK(q_in.is_cuda(), "q_in must be on CUDA");
   TORCH_CHECK(q_in.dim() == 2, "q_in must be 2D [num_tokens, D_q_local]");
   TORCH_CHECK(k_in.dim() == 2, "k_in must be 2D [num_tokens, D_k_local]");
   TORCH_CHECK(q_in.size(0) == k_in.size(0), "q and k must have same num_tokens");
+  TORCH_CHECK(epoch_state.is_cuda() && epoch_state.is_contiguous(),
+              "epoch_state must be a contiguous CUDA tensor");
+  TORCH_CHECK(epoch_state.scalar_type() == torch::kInt32,
+              "epoch_state must have dtype int32");
+  TORCH_CHECK(epoch_state.numel() == 1,
+              "epoch_state must contain exactly one int32 value");
 
   constexpr int kBytesPerAccess = 16;
   int vec_size = kBytesPerAccess / q_in.element_size();
@@ -68,13 +74,13 @@ void novita_qk_rmsnorm_tp(torch::Tensor& q_in,              // [num_tokens, D_q_
   switch (dtype) {
     case at::ScalarType::Half:
       launch_qk_rmsnorm_tp<half>(q_in, k_in, q_out, k_out, q_weight, k_weight, q_eps, k_eps,
-                                  workspace_ptrs, world_size, world_rank, max_tokens, epoch,
+                                  workspace_ptrs, world_size, world_rank, max_tokens, epoch_state,
                                   stream);
       break;
     case at::ScalarType::BFloat16:
       launch_qk_rmsnorm_tp<__nv_bfloat16>(q_in, k_in, q_out, k_out, q_weight, k_weight, q_eps,
                                             k_eps, workspace_ptrs, world_size, world_rank,
-                                            max_tokens, epoch, stream);
+                                            max_tokens, epoch_state, stream);
       break;
     default:
       TORCH_CHECK(false, "novita_qk_rmsnorm_tp: unsupported dtype ", dtype);

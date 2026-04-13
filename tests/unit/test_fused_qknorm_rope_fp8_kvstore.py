@@ -174,7 +174,7 @@ def _run_worker(
     v_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
 
     token_nums = [1, 4, 16, 64, 128]
-    epoch = 0
+    epoch_state = torch.zeros(1, dtype=torch.int32, device=device)
 
     num_blocks = 1024
     block_size = 1
@@ -258,7 +258,6 @@ def _run_worker(
             torch.cuda.synchronize()
             dist.barrier(group=group)
             # --- Fused kernel ---
-            epoch += 1
             q_output = torch.zeros(
                 num_tokens, nq * HEAD_DIM,
                 dtype=torch.float8_e4m3fn, device=device,
@@ -283,7 +282,7 @@ def _run_worker(
                 k_cache, v_cache,
                 slot_mapping, k_scale, v_scale,
                 workspace_ptrs, world_size, rank,
-                MAX_TOKENS, epoch,
+                MAX_TOKENS, epoch_state,
             )
             torch.cuda.synchronize()
 

@@ -15,6 +15,7 @@
  */
 
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -87,11 +88,12 @@ __global__ void fusedQKNormRopeFP8KVStoreKernel(
     void** __restrict__ workspace,
     int const rank,
     int const max_tokens,
-    int const epoch) {
+    int const* __restrict__ epoch_state) {
 
   int const warpId = threadIdx.x / 32;
   int const laneId = threadIdx.x % 32;
   int const tokenIdx = blockIdx.x;
+  int const epoch = epoch_state[0];
   if (tokenIdx >= num_tokens) return;
 
   int const total_local_heads = num_heads_q + num_heads_k + num_heads_v;
@@ -377,7 +379,7 @@ static void launchFusedQKNormRopeFP8KVStore(
     float const* q_scale, int64_t q_output_stride, void* k_cache,
     void* v_cache, int64_t const* slot_mapping, float const* k_scale,
     float const* v_scale, int64_t kv_cache_stride, void** workspace,
-    int rank, int max_tokens, int epoch, int world_size,
+    int rank, int max_tokens, int* epoch_state, int world_size,
     cudaStream_t stream) {
 
   int const total_heads = num_heads_q + num_heads_k + num_heads_v;
@@ -397,7 +399,7 @@ static void launchFusedQKNormRopeFP8KVStore(
           reinterpret_cast<__nv_fp8_e4m3*>(q_output), q_scale,              \
           q_output_stride, reinterpret_cast<__nv_fp8_e4m3*>(k_cache),       \
           reinterpret_cast<__nv_fp8_e4m3*>(v_cache), slot_mapping, k_scale, \
-          v_scale, kv_cache_stride, workspace, rank, max_tokens, epoch)
+          v_scale, kv_cache_stride, workspace, rank, max_tokens, epoch_state)
 
 #define NOVITA_DISPATCH_RANKS(HD, NEOX)         \
   switch (world_size) {                          \
@@ -443,7 +445,7 @@ void fused_qk_norm_rope_fp8_kvstore(
     torch::Tensor& v_cache, torch::Tensor& slot_mapping,
     torch::Tensor& k_scale, torch::Tensor& v_scale,
     torch::Tensor& workspace_ptrs, int64_t world_size, int64_t world_rank,
-    int64_t max_tokens, int64_t epoch) {
+    int64_t max_tokens, torch::Tensor& epoch_state) {
 
   TORCH_CHECK(qkv.is_cuda() && qkv.is_contiguous());
   TORCH_CHECK(qkv.scalar_type() == torch::kBFloat16);
@@ -458,6 +460,9 @@ void fused_qk_norm_rope_fp8_kvstore(
   TORCH_CHECK(q_scale.numel() == 1 && q_scale.scalar_type() == torch::kFloat32);
   TORCH_CHECK(k_scale.numel() == 1 && k_scale.scalar_type() == torch::kFloat32);
   TORCH_CHECK(v_scale.numel() == 1 && v_scale.scalar_type() == torch::kFloat32);
+  TORCH_CHECK(epoch_state.is_cuda() && epoch_state.is_contiguous());
+  TORCH_CHECK(epoch_state.scalar_type() == torch::kInt32);
+  TORCH_CHECK(epoch_state.numel() == 1);
 
   int64_t num_tokens = qkv.size(0);
   int64_t q_output_stride = num_heads_q * head_dim;
@@ -484,5 +489,6 @@ void fused_qk_norm_rope_fp8_kvstore(
       reinterpret_cast<float const*>(k_scale.data_ptr()),
       reinterpret_cast<float const*>(v_scale.data_ptr()), kv_cache_stride,
       ws_ptr, static_cast<int>(world_rank), static_cast<int>(max_tokens),
-      static_cast<int>(epoch), static_cast<int>(world_size), stream);
+      reinterpret_cast<int*>(epoch_state.data_ptr<int32_t>()),
+      static_cast<int>(world_size), stream);
 }

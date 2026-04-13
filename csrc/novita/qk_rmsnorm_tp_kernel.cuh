@@ -15,8 +15,10 @@
 //     [q_sum_of_squares, k_sum_of_squares, epoch_flag(as int)]
 //   Index: src_rank * max_tokens * 3 + token_id * 3 + {0,1,2}
 //
-// Synchronization: epoch-based flag. Writer stores data then epoch via
-// __threadfence_system(). Reader polls for matching epoch.
+// Synchronization: epoch-based flag. The Python wrapper bumps the single-value
+// CUDA tensor `epoch_state` using a capture-safe `Tensor.add_(1)` before launch.
+// Writers store data then epoch via __threadfence_system(). Readers poll for a
+// matching epoch value.
 
 #pragma once
 
@@ -90,13 +92,15 @@ __global__ void fused_qk_rmsnorm_tp_kernel(T* __restrict__ q_in, T* __restrict__
                                            const T* __restrict__ k_weight, float q_eps, float k_eps,
                                            int D_q_local, int D_k_local, int D_q_full, int D_k_full,
                                            int num_tokens, int max_tokens,
-                                           void** __restrict__ workspace, int rank, int epoch) {
+                                           void** __restrict__ workspace, int rank,
+                                           int const* __restrict__ epoch_state) {
   static constexpr int VEC_SIZE = 16 / sizeof(T);
 
   int token_id = blockIdx.x;
   if (token_id >= num_tokens) return;
 
   int tid = threadIdx.x;
+  int const epoch = epoch_state[0];
 
   // ============ Phase 1: Compute local sum of squares ============
   float q_ss = 0.0f, k_ss = 0.0f;
@@ -212,7 +216,8 @@ template <typename T, int NRanks>
 cudaError_t launch_fused_qk_rmsnorm_tp(T* q_in, T* k_in, T* q_out, T* k_out, const T* q_weight,
                                         const T* k_weight, float q_eps, float k_eps, int D_q_local,
                                         int D_k_local, int D_q_full, int D_k_full, int num_tokens,
-                                        int max_tokens, void** workspace, int rank, int epoch,
+                                        int max_tokens, void** workspace, int rank,
+                                        int* epoch_state,
                                         cudaStream_t stream) {
   constexpr int VEC_SIZE = 16 / sizeof(T);
   int threads_needed = D_q_local / VEC_SIZE;
@@ -222,7 +227,7 @@ cudaError_t launch_fused_qk_rmsnorm_tp(T* q_in, T* k_in, T* q_out, T* k_out, con
 
   fused_qk_rmsnorm_tp_kernel<T, NRanks><<<grid_size, block_size, 0, stream>>>(
       q_in, k_in, q_out, k_out, q_weight, k_weight, q_eps, k_eps, D_q_local, D_k_local, D_q_full,
-      D_k_full, num_tokens, max_tokens, workspace, rank, epoch);
+      D_k_full, num_tokens, max_tokens, workspace, rank, epoch_state);
 
   return cudaGetLastError();
 }
@@ -232,7 +237,8 @@ cudaError_t dispatch_fused_qk_rmsnorm_tp(T* q_in, T* k_in, T* q_out, T* k_out, c
                                           const T* k_weight, float q_eps, float k_eps,
                                           int D_q_local, int D_k_local, int world_size,
                                           int num_tokens, int max_tokens, void** workspace,
-                                          int rank, int epoch, cudaStream_t stream) {
+                                          int rank, int* epoch_state,
+                                          cudaStream_t stream) {
   int D_q_full = D_q_local * world_size;
   int D_k_full = D_k_local * world_size;
 
@@ -240,7 +246,7 @@ cudaError_t dispatch_fused_qk_rmsnorm_tp(T* q_in, T* k_in, T* q_out, T* k_out, c
   return launch_fused_qk_rmsnorm_tp<T, NRANKS>(q_in, k_in, q_out, k_out, q_weight, k_weight,  \
                                                 q_eps, k_eps, D_q_local, D_k_local, D_q_full,  \
                                                 D_k_full, num_tokens, max_tokens, workspace,    \
-                                                rank, epoch, stream)
+                                                rank, epoch_state, stream)
 
   switch (world_size) {
     case 1:

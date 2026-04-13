@@ -198,7 +198,7 @@ def _run_correctness_worker(
 
         token_nums = [1, 4, 16, 64, 128]
         eps = 1e-6
-        epoch = 0
+        epoch_state = torch.zeros(1, dtype=torch.int32, device=device)
 
         for token_num in token_nums:
             if token_num > MAX_TOKENS:
@@ -226,7 +226,6 @@ def _run_correctness_worker(
             )
 
             # --- Fused kernel ---
-            epoch += 1
             q_out = torch.empty_like(q)
             k_out = torch.empty_like(k)
 
@@ -236,7 +235,7 @@ def _run_correctness_worker(
                 eps, eps,
                 workspace_ptrs,
                 world_size, rank,
-                MAX_TOKENS, epoch,
+                MAX_TOKENS, epoch_state,
             )
             torch.cuda.synchronize()
 

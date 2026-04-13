@@ -75,14 +75,10 @@ def register_novita_ops() -> None:
 class _QKNormTPWorkspace:
     workspace_ptrs: torch.Tensor
     local_buf: torch.Tensor
+    epoch_state: torch.Tensor
     max_tokens: int
     world_size: int
     rank: int
-    epoch: int = 0
-
-    def next_epoch(self) -> int:
-        self.epoch += 1
-        return self.epoch
 
 
 _qk_norm_tp_workspaces: dict[tuple[int, int, int, int], _QKNormTPWorkspace] = {}
@@ -104,6 +100,7 @@ def _create_qk_norm_tp_workspace(
 
     buf_size = world_size * max_tokens * 3
     local_buf = torch.zeros(buf_size, dtype=torch.float32, device=device)
+    epoch_state = torch.zeros(1, dtype=torch.int32, device=device)
 
     if world_size == 1:
         workspace_ptrs = torch.tensor(
@@ -112,6 +109,7 @@ def _create_qk_norm_tp_workspace(
         return _QKNormTPWorkspace(
             workspace_ptrs=workspace_ptrs,
             local_buf=local_buf,
+            epoch_state=epoch_state,
             max_tokens=max_tokens,
             world_size=world_size,
             rank=rank,
@@ -137,6 +135,7 @@ def _create_qk_norm_tp_workspace(
     return _QKNormTPWorkspace(
         workspace_ptrs=workspace_ptrs,
         local_buf=local_buf,
+        epoch_state=epoch_state,
         max_tokens=max_tokens,
         world_size=world_size,
         rank=rank,
@@ -168,6 +167,43 @@ def _get_qk_norm_tp_workspace(
     )
     _qk_norm_tp_workspaces[cache_key] = workspace
     return workspace
+
+
+def ensure_novita_qk_workspace_initialized(
+    *,
+    device: torch.device | None = None,
+    max_tokens: int,
+) -> _QKNormTPWorkspace | None:
+    """Best-effort eager initialization for the shared TP QK workspace.
+
+    This is intended for model/runtime setup so the fused path does not need to
+    create IPC-backed state for the first time during CUDA graph capture.
+    """
+    if not _novita_available or not current_platform.is_cuda():
+        return None
+
+    from vllm.distributed import get_tp_group
+
+    try:
+        tp_group = get_tp_group()
+    except AssertionError:
+        return None
+
+    if device is None:
+        if not torch.cuda.is_available():
+            return None
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    if device.type != "cuda":
+        return None
+
+    return _get_qk_norm_tp_workspace(
+        device=device,
+        group=tp_group.cpu_group,
+        world_size=tp_group.world_size,
+        rank=tp_group.rank_in_group,
+        max_tokens=max_tokens,
+    )
 
 
 def _tp_qk_rmsnorm_fallback(
@@ -278,8 +314,6 @@ def novita_fused_attn(
         rank=rank,
         max_tokens=max_tokens,
     )
-    epoch = workspace.next_epoch()
-
     if layer_name not in _logged_fused_attn_layers:
         logger.info(
             "novita fused kernel ACTIVE for layer %s (tp=%d, max_tokens=%d)",
@@ -289,6 +323,8 @@ def novita_fused_attn(
         )
         _logged_fused_attn_layers.add(layer_name)
 
+    # Device-side tensor mutation is capture-safe; Python integer mutation is not.
+    workspace.epoch_state.add_(1)
     q_output = torch.empty(
         num_tokens, q_size, dtype=torch.float8_e4m3fn, device=qkv.device
     )
@@ -318,7 +354,7 @@ def novita_fused_attn(
         world_size,
         rank,
         max_tokens,
-        epoch,
+        workspace.epoch_state,
     )
 
     q_view = q_output.view(-1, num_heads_q, head_dim)
@@ -595,9 +631,6 @@ def call_novita_fused_allreduce_norm_fake(
 # Fused QK RMS Norm with TP variance all-reduce
 # ---------------------------------------------------------------------------
 
-_qk_norm_epoch = 0
-
-
 def novita_fused_qk_rmsnorm_tp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -630,11 +663,13 @@ def novita_fused_qk_rmsnorm_tp(
     Returns:
         (q_out, k_out) normalized tensors with same shape and dtype as inputs
     """
-    global _qk_norm_epoch
-    _qk_norm_epoch += 1
-
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
+
+    if workspace_ptrs.device.type != "cuda":
+        raise ValueError("workspace_ptrs must be a CUDA tensor")
+    epoch_state = torch.zeros(1, dtype=torch.int32, device=workspace_ptrs.device)
+    epoch_state.add_(1)
 
     torch.ops._novita_C.qk_rmsnorm_tp(
         q, k, q_out, k_out,
@@ -642,7 +677,7 @@ def novita_fused_qk_rmsnorm_tp(
         q_eps, k_eps,
         workspace_ptrs,
         world_size, rank,
-        max_tokens, _qk_norm_epoch,
+        max_tokens, epoch_state,
     )
 
     return q_out, k_out

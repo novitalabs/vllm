@@ -23,7 +23,7 @@ void novita_qk_rmsnorm_tp(
     double q_eps, double k_eps,
     torch::Tensor& workspace_ptrs,
     int64_t world_size, int64_t world_rank,
-    int64_t max_tokens, int64_t epoch);
+    int64_t max_tokens, torch::Tensor& epoch_state);
 
 void novita_clear_qk_norm_workspace(
     torch::Tensor& workspace_ptrs, int64_t world_size,
@@ -41,7 +41,7 @@ void fused_qk_norm_rope_fp8_kvstore(
     torch::Tensor& k_cache, torch::Tensor& v_cache,
     torch::Tensor& slot_mapping, torch::Tensor& k_scale, torch::Tensor& v_scale,
     torch::Tensor& workspace_ptrs, int64_t world_size, int64_t world_rank,
-    int64_t max_tokens, int64_t epoch);
+    int64_t max_tokens, torch::Tensor& epoch_state);
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
@@ -62,7 +62,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "float q_eps, float k_eps, "
       "Tensor workspace_ptrs, "
       "int world_size, int world_rank, "
-      "int max_tokens, int epoch) -> ()");
+      "int max_tokens, Tensor epoch_state) -> ()");
   ops.impl("qk_rmsnorm_tp", torch::kCUDA, &novita_qk_rmsnorm_tp);
 
   ops.def(
@@ -82,7 +82,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor! k_cache, Tensor! v_cache, "
       "Tensor slot_mapping, Tensor k_scale, Tensor v_scale, "
       "Tensor workspace_ptrs, int world_size, int world_rank, "
-      "int max_tokens, int epoch) -> ()");
+      "int max_tokens, Tensor epoch_state) -> ()");
   ops.impl("fused_qk_norm_rope_fp8_kvstore", torch::kCUDA,
            &fused_qk_norm_rope_fp8_kvstore);
 }

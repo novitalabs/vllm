@@ -75,6 +75,84 @@ def _make_fake_vllm_config(enable_fused: bool):
     )
 
 
+def test_minimax_m2_attention_prefetches_novita_workspace(monkeypatch):
+    monkeypatch.setattr(
+        minimax_m2, "get_current_vllm_config", lambda: _make_fake_vllm_config(True)
+    )
+    monkeypatch.setattr(
+        minimax_m2, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(minimax_m2, "QKVParallelLinear", _FakeQKVParallelLinear)
+    monkeypatch.setattr(minimax_m2, "RowParallelLinear", _FakeRowParallelLinear)
+    monkeypatch.setattr(minimax_m2, "Attention", _FakeAttentionLayer)
+    monkeypatch.setattr(minimax_m2, "MiniMaxText01RMSNormTP", _FakeRMSNormTP)
+    monkeypatch.setattr(minimax_m2, "get_rope", lambda *args, **kwargs: _FakeRotaryEmbedding())
+    monkeypatch.setattr(novita_ops, "is_novita_available", lambda: True)
+
+    init_calls = []
+
+    def _fake_init_workspace(*, device, max_tokens):
+        init_calls.append((device, max_tokens))
+
+    monkeypatch.setattr(
+        minimax_m2,
+        "ensure_novita_qk_workspace_initialized",
+        _fake_init_workspace,
+    )
+
+    minimax_m2.MiniMaxM2Attention(
+        hidden_size=16,
+        num_heads=4,
+        num_kv_heads=2,
+        rotary_dim=4,
+        head_dim=4,
+        prefix="model.layers.0.self_attn",
+    )
+
+    assert init_calls == [(None, 64)]
+
+
+def test_qk_workspace_cache_reuses_shared_state(monkeypatch):
+    workspace = novita_ops._QKNormTPWorkspace(
+        workspace_ptrs=torch.tensor([123], dtype=torch.int64),
+        local_buf=torch.zeros(3, dtype=torch.float32),
+        epoch_state=torch.zeros(1, dtype=torch.int32),
+        max_tokens=64,
+        world_size=1,
+        rank=0,
+    )
+    create_calls = []
+    clear_calls = []
+
+    monkeypatch.setattr(novita_ops, "_qk_norm_tp_workspaces", {})
+
+    def _fake_create(**kwargs):
+        create_calls.append(kwargs)
+        return workspace
+
+    monkeypatch.setattr(novita_ops, "_create_qk_norm_tp_workspace", _fake_create)
+    monkeypatch.setattr(
+        novita_ops,
+        "novita_clear_qk_norm_workspace",
+        lambda *args: clear_calls.append(args),
+    )
+
+    args = dict(
+        device=torch.device("cuda:0"),
+        group=object(),
+        world_size=1,
+        rank=0,
+        max_tokens=64,
+    )
+    first = novita_ops._get_qk_norm_tp_workspace(**args)
+    second = novita_ops._get_qk_norm_tp_workspace(**args)
+
+    assert first is workspace
+    assert second is workspace
+    assert len(create_calls) == 1
+    assert len(clear_calls) == 1
+
+
 def test_minimax_m2_attention_uses_novita_fused_path(monkeypatch):
     monkeypatch.setattr(
         minimax_m2, "get_current_vllm_config", lambda: _make_fake_vllm_config(True)
@@ -123,6 +201,88 @@ def test_minimax_m2_attention_uses_novita_fused_path(monkeypatch):
     assert fused_args[20] == 64
     assert fused_args[21] is True
     assert output.shape == (2, 16)
+
+
+def test_novita_fused_attn_passes_device_epoch_state(monkeypatch):
+    epoch_state = torch.zeros(1, dtype=torch.int32)
+    workspace = novita_ops._QKNormTPWorkspace(
+        workspace_ptrs=torch.tensor([123], dtype=torch.int64),
+        local_buf=torch.zeros(3, dtype=torch.float32),
+        epoch_state=epoch_state,
+        max_tokens=64,
+        world_size=1,
+        rank=0,
+    )
+    fused_kernel_args = []
+
+    monkeypatch.setattr(
+        distributed_module, "get_tp_group", lambda: types.SimpleNamespace(
+            world_size=1,
+            rank_in_group=0,
+            cpu_group=object(),
+            device_group=object(),
+        )
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "get_attention_context",
+        lambda layer_name: (
+            None,
+            None,
+            torch.ones((2, 4, 8), dtype=torch.float8_e4m3fn),
+            torch.arange(2, dtype=torch.int64),
+        ),
+    )
+    monkeypatch.setattr(
+        novita_ops,
+        "_get_qk_norm_tp_workspace",
+        lambda **kwargs: workspace,
+    )
+
+    def _fake_fused_kernel(*args, **kwargs):
+        fused_kernel_args.append(args)
+        q_output = args[14]
+        q_output.copy_(torch.zeros_like(q_output))
+
+    monkeypatch.setattr(
+        attention_module,
+        "unified_attention_with_output",
+        lambda q, k, v, output, layer_name, **kwargs: output.zero_(),
+    )
+    monkeypatch.setattr(
+        novita_ops.torch.ops._novita_C,
+        "fused_qk_norm_rope_fp8_kvstore",
+        _fake_fused_kernel,
+        raising=False,
+    )
+
+    novita_ops.novita_fused_attn(
+        qkv=torch.randn(2, 32),
+        positions=torch.arange(2, dtype=torch.long),
+        q_weight=torch.ones(16),
+        k_weight=torch.ones(8),
+        cos_sin_cache=torch.ones((32, 4), dtype=torch.bfloat16),
+        q_scale=torch.tensor(1.0),
+        k_scale=torch.tensor(1.0),
+        v_scale=torch.tensor(1.0),
+        output=torch.empty(2, 16),
+        layer_name="model.layers.0.self_attn.attn",
+        num_heads_q=4,
+        num_heads_k=2,
+        num_heads_v=2,
+        num_heads_q_total=4,
+        num_heads_k_total=2,
+        head_dim=4,
+        q_size=16,
+        kv_size=8,
+        eps=1e-6,
+        rotary_dim=4,
+        max_tokens=64,
+        is_neox=True,
+    )
+
+    assert fused_kernel_args, "expected fused kernel to be invoked"
+    assert fused_kernel_args[0][25] is epoch_state
 
 
 def test_novita_fused_attn_falls_back_for_empty_kv_cache(monkeypatch):
